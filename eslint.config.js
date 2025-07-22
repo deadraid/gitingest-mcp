@@ -1,11 +1,9 @@
-import typescriptEslint from '@typescript-eslint/eslint-plugin';
-import tsParser from '@typescript-eslint/parser';
-import prettier from 'eslint-plugin-prettier';
-import configPrettier from 'eslint-config-prettier';
+import tseslint from 'typescript-eslint';
+import eslintConfigPrettier from 'eslint-config-prettier/flat';
 import js from '@eslint/js';
 import globals from 'globals';
 
-export default [
+export default tseslint.config(
   {
     ignores: [
       '**/node_modules/',
@@ -17,28 +15,22 @@ export default [
     ],
   },
   js.configs.recommended,
-  configPrettier,
+  ...tseslint.configs.recommended,
+  eslintConfigPrettier,
   {
     files: ['**/*.ts'],
-    plugins: {
-      '@typescript-eslint': typescriptEslint,
-      prettier,
-    },
-
     languageOptions: {
       globals: {
         ...globals.node,
       },
-
-      parser: tsParser,
-      ecmaVersion: 2022,
-      sourceType: 'module',
-
       parserOptions: {
-        project: './tsconfig.json',
+        project: true,
+        tsconfigRootDir: import.meta.dirname,
       },
     },
-
+    plugins: {
+      prettier: tseslint.plugin,
+    },
     rules: {
       semi: ['error', 'always'],
       quotes: [
@@ -54,4 +46,4 @@ export default [
       'prettier/prettier': 'error',
     },
   },
-];
+);
