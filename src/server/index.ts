@@ -13,11 +13,13 @@ import { ingestTool, ingestSchema } from '../tools/ingest.js';
 // Default configuration constants
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_DELAY = 1000;
+const DEFAULT_TIMEOUT = 30000; // 30 seconds
 
 const mcpConfig = {
   defaults: {
     maxRetries: DEFAULT_MAX_RETRIES,
     retryDelay: DEFAULT_RETRY_DELAY,
+    timeout: DEFAULT_TIMEOUT,
   },
 };
 
@@ -45,40 +47,71 @@ server.setRequestHandler(ListToolsRequestSchema, () => {
       {
         name: 'ingest_repository',
         description: `
-Transform a Git repository into a prompt-friendly text digest for LLMs.
+Transform a Git repository into a prompt-friendly text digest for LLMs with enhanced capabilities.
 
-**Best for:** Getting structured code context from Git repositories for AI analysis
-**Not recommended for:** When you need the raw binary files or full repository cloning
-**Common mistakes:** Using this tool without proper authentication for private repositories
-**Prompt Example:** "Analyze the codebase at https://github.com/coderamp-labs/gitingest"
+**Best for:** Comprehensive code context analysis with support for multiple Git hosts, local repositories, and advanced filtering
+**Not recommended for:** Simple use cases where basic functionality is sufficient
+**Common mistakes:** Not specifying branch/tag when needed, ignoring file size limits
+**Prompt Example:** "Analyze the codebase at user/repo with all branches"
 **Usage Example:**
 \`\`\`json
 {
   "name": "ingest_repository",
   "arguments": {
-    "repository": "https://github.com/coderamp-labs/gitingest",
-    "token": "github_pat_...",
-    "includeSubmodules": true,
+    "repository": "user/repo",
+    "branch": "main",
     "includeGitignored": false,
-    "excludePatterns": ["*.md", "*.txt"],
-    "maxFileSize": 100000
+    "maxFileSize": 50000,
+    "maxFiles": 200,
+    "maxTotalSize": 10000000
   }
 }
 \`\`\`
-**Returns:** A structured text digest containing code content, file tree, and repository statistics.
+**Returns:** A structured text digest containing code content, file tree, and repository statistics with enhanced metadata.
 `,
         inputSchema: {
           type: 'object',
           properties: {
             repository: {
               type: 'string',
-              description: 'Git repository URL or local path',
-            },
-            token: {
-              type: 'string',
               description:
-                'GitHub Personal Access Token for private repositories',
+                'Git repository URL, local path, or shorthand (user/repo)',
+            },
+            source: {
+              type: 'string',
+              enum: ['github', 'gitlab', 'bitbucket', 'local', 'git'],
+              description: 'Explicit source type (optional, auto-detected)',
               optional: true,
+            },
+            branch: {
+              type: 'string',
+              description: 'Branch to analyze (optional, defaults to main)',
+              optional: true,
+            },
+            commit: {
+              type: 'string',
+              description: 'Specific commit to analyze (optional)',
+              optional: true,
+            },
+            tag: {
+              type: 'string',
+              description: 'Specific tag to analyze (optional)',
+              optional: true,
+            },
+            subpath: {
+              type: 'string',
+              description: 'Specific subpath to analyze (optional)',
+              optional: true,
+            },
+            cloneDepth: {
+              type: 'number',
+              description: 'Depth of git clone (1-1000, default: 1)',
+              default: 1,
+            },
+            sparseCheckout: {
+              type: 'boolean',
+              description: 'Use sparse checkout for large repositories',
+              default: false,
             },
             includeSubmodules: {
               type: 'boolean',
@@ -90,17 +123,47 @@ Transform a Git repository into a prompt-friendly text digest for LLMs.
               description: 'Include files listed in .gitignore',
               default: false,
             },
+            useGitignore: {
+              type: 'boolean',
+              description: 'Use .gitignore file for filtering',
+              default: true,
+            },
+            useGitingestignore: {
+              type: 'boolean',
+              description: 'Use .gitingestignore file for filtering',
+              default: true,
+            },
             excludePatterns: {
               type: 'array',
               items: { type: 'string' },
+              description: 'Glob patterns to exclude files',
+              optional: true,
+            },
+            includePatterns: {
+              type: 'array',
+              items: { type: 'string' },
               description:
-                'Glob patterns to exclude files (e.g., "*.md", "test/*")',
+                'Glob patterns to include files (if specified, only these files are included)',
               optional: true,
             },
             maxFileSize: {
               type: 'number',
-              description:
-                'Maximum file size in bytes to include (default: unlimited)',
+              description: 'Maximum file size in bytes to include',
+              optional: true,
+            },
+            maxFiles: {
+              type: 'number',
+              description: 'Maximum number of files to include (default: 1000)',
+              default: 1000,
+            },
+            maxTotalSize: {
+              type: 'number',
+              description: 'Maximum total size in bytes (default: 50MB)',
+              default: 50 * 1024 * 1024,
+            },
+            token: {
+              type: 'string',
+              description: 'Access token for private repositories',
               optional: true,
             },
             maxRetries: {
@@ -112,6 +175,12 @@ Transform a Git repository into a prompt-friendly text digest for LLMs.
               type: 'number',
               description: 'Base delay in milliseconds between retry attempts',
               default: mcpConfig.defaults.retryDelay,
+            },
+            timeout: {
+              type: 'number',
+              description:
+                'Maximum time in milliseconds to complete the operation',
+              default: mcpConfig.defaults.timeout,
             },
           },
           required: ['repository'],
@@ -142,6 +211,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           {
             type: 'text',
             text: `Invalid input: ${error.issues.map((e) => `${e.path.join('.')}: ${e.message}`).join(', ')}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // Handle timeout error
+    if (error instanceof Error && error.message.includes('timed out')) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Request timed out: ${error.message}`,
           },
         ],
         isError: true,
