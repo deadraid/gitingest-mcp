@@ -1,17 +1,17 @@
-import tseslint from 'typescript-eslint';
-import eslintConfigPrettier from 'eslint-config-prettier/flat';
 import js from '@eslint/js';
+import eslintConfigPrettier from 'eslint-config-prettier/flat';
+import prettierPlugin from 'eslint-plugin-prettier';
 import globals from 'globals';
+import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
     ignores: [
-      '**/node_modules/',
-      '**/dist/',
-      '**/.env',
+      '**/node_modules/**',
+      '**/dist/**',
+      '**/coverage/**',
+      '**/.env*',
       'eslint.config.js',
-      'examples/**',
-      'test/**',
     ],
   },
   js.configs.recommended,
@@ -20,30 +20,18 @@ export default tseslint.config(
   {
     files: ['**/*.ts'],
     languageOptions: {
-      globals: {
-        ...globals.node,
-      },
-      parserOptions: {
-        project: true,
-        tsconfigRootDir: import.meta.dirname,
-      },
+      globals: globals.node,
     },
     plugins: {
-      prettier: tseslint.plugin,
+      prettier: prettierPlugin,
     },
     rules: {
-      semi: ['error', 'always'],
-      quotes: [
+      '@typescript-eslint/no-explicit-any': 'warn',
+      '@typescript-eslint/no-unused-vars': [
         'error',
-        'double',
-        {
-          avoidEscape: true,
-        },
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
       ],
-      '@typescript-eslint/no-unused-vars': 'warn',
-      '@typescript-eslint/no-explicit-any': 'off',
-      '@typescript-eslint/no-floating-promises': 'off',
       'prettier/prettier': 'error',
     },
-  },
+  }
 );

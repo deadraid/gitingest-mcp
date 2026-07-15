@@ -1,215 +1,329 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { ingestTool, ingestSchema } from '../../src/tools/ingest.js';
-import { z } from 'zod';
-import { LocalRepositoryTool } from '../../src/tools/local-repository.js';
+import { promises as fs } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../../src/tools/git-clone.js', () => {
-  const GitCloneTool = {
-    clone: vi.fn(),
-    cleanup: vi.fn(),
-  };
-  return { GitCloneTool };
-});
+import { GitCloneTool } from '../../src/tools/git-clone.js';
+import { ingestTool, type IngestToolResult } from '../../src/tools/ingest.js';
 
-vi.mock('../../src/tools/local-repository.js', () => {
-  const LocalRepositoryTool = {
-    analyze: vi.fn(),
-  };
-  return { LocalRepositoryTool };
-});
+describe('remote repository ingestion', () => {
+  let workspacePath: string;
+  let repositoryPath: string;
 
-vi.mock('../../src/tools/filter-engine.js', () => {
-
-  class MockFilterEngine {
-    options: Record<string, any>;
-    loadIgnorePatterns: () => Promise<void>;
-    shouldIncludeFile: () => { shouldInclude: boolean };
-
-    constructor(options: Record<string, any>) {
-      this.options = options || {};
-      this.loadIgnorePatterns = vi.fn().mockResolvedValue(undefined);
-      this.shouldIncludeFile = vi.fn().mockReturnValue({ shouldInclude: true });
-    }
-  }
-
-  return { FilterEngine: MockFilterEngine };
-});
-
-vi.mock('fs/promises', () => ({
-  readFile: vi.fn().mockResolvedValue('file content'),
-}));
-
-describe('ingestTool', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
+  beforeEach(async () => {
+    workspacePath = await fs.mkdtemp(join(tmpdir(), 'gitingest-remote-test-'));
+    repositoryPath = join(workspacePath, 'repository');
+    await fs.mkdir(repositoryPath);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.restoreAllMocks();
+    await fs.rm(workspacePath, { recursive: true, force: true });
   });
 
-  describe('Schema Validation', () => {
-    it('should validate schema with various inputs', () => {
-
-      expect(() => ingestSchema.parse({})).toThrow(z.ZodError);
-
-
-      const validInput = { repository: 'test-repo' };
-      const result = ingestSchema.parse(validInput);
-      expect(result.repository).toBe('test-repo');
-
-
-      const inputWithTimeout = { repository: 'test-repo', timeout: 5000 };
-      const parsed = ingestSchema.parse(inputWithTimeout);
-      expect(parsed.timeout).toBe(5000);
-
-
-      const minimalInput = { repository: 'test-repo' };
-      const parsedDefaults = ingestSchema.parse(minimalInput);
-      expect(parsedDefaults.cloneDepth).toBe(1);
-      expect(parsedDefaults.maxFiles).toBe(1000);
-      expect(parsedDefaults.maxTotalSize).toBe(50 * 1024 * 1024);
-      expect(parsedDefaults.timeout).toBe(30000);
+  it('passes HTTPS token authentication without placing it in output', async () => {
+    // Arrange
+    await fs.writeFile(join(repositoryPath, 'README.md'), '# repository');
+    const clone = vi.spyOn(GitCloneTool, 'clone').mockResolvedValue({
+      path: repositoryPath,
+      cleanupPath: workspacePath,
+      branch: 'main',
+      commit: 'abc123',
+      isShallow: true,
     });
+    const cleanup = vi.spyOn(GitCloneTool, 'cleanup').mockResolvedValue();
+
+    // Act
+    const result = await ingestTool({
+      repository: 'https://github.com/owner/repository',
+      token: 'top-secret-token',
+    });
+    const output = resultText(result);
+
+    // Assert
+    expect(clone).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: 'https://github.com/owner/repository.git',
+        auth: {
+          token: 'top-secret-token',
+          username: 'x-access-token',
+        },
+      }),
+      expect.any(AbortSignal)
+    );
+    expect(output).toContain('## README.md');
+    expect(output).not.toContain('top-secret-token');
+    expect(cleanup).toHaveBeenCalledWith(workspacePath);
   });
 
-  describe('Local Repository Processing', () => {
-    it('should process local repository successfully', async () => {
-      // Arrange
-      const mockRepositoryData = {
-        path: '/tmp/repo',
-        summary: {
-          path: '/tmp/repo',
-          branch: 'main',
-          commit: 'abc123',
-          fileCount: 1,
-          directoryCount: 1,
-          totalSize: 25,
-          tokenCount: 7,
-          createdAt: new Date().toISOString(),
-        },
-        files: [
-          {
-            path: 'src/index.ts',
-            content: 'console.log("Hello World");',
-            size: 25,
-            type: 'file' as const,
-          },
-        ],
-        tree: {
-          name: '',
-          type: 'directory' as const,
-          children: [
-            {
-              name: 'src',
-              type: 'directory' as const,
-              children: [
-                {
-                  name: 'index.ts',
-                  type: 'file' as const,
-                  size: 25,
-                },
-              ],
-            },
-          ],
-        },
-      };
+  it('cleans a successful clone when scanning fails afterwards', async () => {
+    // Arrange
+    const missingPath = join(workspacePath, 'missing');
+    vi.spyOn(GitCloneTool, 'clone').mockResolvedValue({
+      path: missingPath,
+      cleanupPath: workspacePath,
+      branch: 'main',
+      commit: 'abc123',
+      isShallow: true,
+    });
+    const cleanup = vi.spyOn(GitCloneTool, 'cleanup').mockResolvedValue();
 
-      vi.mocked(LocalRepositoryTool.analyze).mockResolvedValue(
-        mockRepositoryData
-      );
+    // Act
+    const result = await ingestTool({ repository: 'owner/repository' });
 
-      // Act
-      const result = await ingestTool({
-        repository: '/path/to/local/repo',
-        cloneDepth: 1,
-        sparseCheckout: false,
-        includeSubmodules: false,
-        includeGitignored: false,
-        useGitignore: true,
-        useGitingestignore: true,
-        maxFiles: 1000,
-        maxFileSize: undefined,
-        excludePatterns: [],
-        includePatterns: [],
-        maxTotalSize: 50 * 1024 * 1024,
-        token: undefined,
-        maxRetries: 3,
-        retryDelay: 1000,
-        timeout: 30000,
-      });
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(cleanup).toHaveBeenCalledWith(workspacePath);
+  });
 
-      // Assert
-      expect(LocalRepositoryTool.analyze).toHaveBeenCalledWith(
-        {
-          path: '/path/to/local/repo',
-          includeGitignored: false,
-          useGitignore: true,
-          useGitingestignore: true,
-          maxFileSize: undefined,
-          maxFiles: 1000,
-          excludePatterns: [],
-          includePatterns: [],
-        },
-        expect.any(AbortSignal)
-      );
+  it('preserves SSH URLs and rejects an unrelated token', async () => {
+    // Arrange
+    const clone = vi.spyOn(GitCloneTool, 'clone');
 
-      expect(result.content[0].text).toContain('Repository Summary');
-      expect(result.content[0].text).toContain('src/index.ts');
-      expect(result.content[0].text).toContain('main');
-      expect(result.content[0].text).toContain('abc123');
+    // Act
+    const result = await ingestTool({
+      repository: 'git@github.com:owner/private.git',
+      token: 'unused-token',
     });
 
-    it('should handle empty local repository', async () => {
-      // Arrange
-      const mockEmptyRepository = {
-        path: '/tmp/empty-repo',
-        summary: {
-          path: '/tmp/empty-repo',
-          branch: 'main',
-          commit: 'abc123',
-          fileCount: 0,
-          directoryCount: 0,
-          totalSize: 0,
-          tokenCount: 0,
-          createdAt: new Date().toISOString(),
-        },
-        files: [],
-        tree: {
-          name: '',
-          type: 'directory' as const,
-          children: [],
-        },
-      };
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('supported only for HTTPS');
+    expect(clone).not.toHaveBeenCalled();
+  });
 
-      vi.mocked(LocalRepositoryTool.analyze).mockResolvedValue(
-        mockEmptyRepository
-      );
+  it('rejects remote hosts outside the transport allowlist', async () => {
+    // Arrange
+    const clone = vi.spyOn(GitCloneTool, 'clone');
 
-      // Act
-      const result = await ingestTool({
-        repository: '/path/to/empty/repo',
-        cloneDepth: 1,
-        sparseCheckout: false,
-        includeSubmodules: false,
-        includeGitignored: false,
-        useGitignore: true,
-        useGitingestignore: true,
-        maxFiles: 1000,
-        maxFileSize: undefined,
-        excludePatterns: [],
-        includePatterns: [],
-        maxTotalSize: 50 * 1024 * 1024,
-        token: undefined,
-        maxRetries: 3,
-        retryDelay: 1000,
-        timeout: 30000,
-      });
+    // Act
+    const result = await ingestTool(
+      { repository: 'https://code.example.com/team/repository.git' },
+      {
+        allowUnrestrictedRemoteRepositories: false,
+        allowedRemoteHosts: ['github.com'],
+      }
+    );
 
-      // Assert
-      expect(result.content[0].text).toContain('**Files**: 0');
-      expect(result.content[0].text).toContain('**Directories**: 0');
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('outside the configured allowlist');
+    expect(clone).not.toHaveBeenCalled();
+  });
+
+  it('allows explicitly configured wildcard remote hosts', async () => {
+    // Arrange
+    await fs.writeFile(join(repositoryPath, 'README.md'), '# repository');
+    const clone = vi.spyOn(GitCloneTool, 'clone').mockResolvedValue({
+      path: repositoryPath,
+      cleanupPath: workspacePath,
+      branch: 'main',
+      commit: 'abc123',
+      isShallow: true,
     });
+    vi.spyOn(GitCloneTool, 'cleanup').mockResolvedValue();
+
+    // Act
+    const result = await ingestTool(
+      { repository: 'https://git.code.example.com/team/repository.git' },
+      {
+        allowUnrestrictedRemoteRepositories: false,
+        allowedRemoteHosts: ['*.code.example.com'],
+      }
+    );
+
+    // Assert
+    expect(result.isError).toBeUndefined();
+    expect(resultText(result)).toContain('## README.md');
+    expect(clone).toHaveBeenCalledOnce();
+  });
+
+  it('never sends a token over plain HTTP', async () => {
+    // Arrange
+    const clone = vi.spyOn(GitCloneTool, 'clone');
+
+    // Act
+    const result = await ingestTool({
+      repository: 'http://code.example.com/team/repository.git',
+      token: 'must-not-be-sent',
+    });
+
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('supported only for HTTPS');
+    expect(clone).not.toHaveBeenCalled();
+  });
+
+  it('blocks unencrypted remote transports when the server requires it', async () => {
+    // Arrange
+    const clone = vi.spyOn(GitCloneTool, 'clone');
+
+    // Act
+    const results = await Promise.all([
+      ingestTool(
+        { repository: 'http://github.com/owner/repository.git' },
+        { allowInsecureRemoteRepositories: false }
+      ),
+      ingestTool(
+        { repository: 'git://github.com/owner/repository.git' },
+        { allowInsecureRemoteRepositories: false }
+      ),
+    ]);
+
+    // Assert
+    for (const result of results) {
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toContain('transports are disabled');
+    }
+    expect(clone).not.toHaveBeenCalled();
+  });
+
+  it('blocks submodule egress when the transport disables it', async () => {
+    // Arrange
+    const clone = vi.spyOn(GitCloneTool, 'clone');
+
+    // Act
+    const result = await ingestTool(
+      {
+        repository: 'https://github.com/owner/repository.git',
+        includeSubmodules: true,
+      },
+      { allowSubmodules: false }
+    );
+
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('Submodule cloning is disabled');
+    expect(clone).not.toHaveBeenCalled();
+  });
+
+  it('forwards refs, sparse checkout, and submodule options precisely', async () => {
+    // Arrange
+    await fs.writeFile(join(repositoryPath, 'README.md'), '# repository');
+    const clone = vi.spyOn(GitCloneTool, 'clone').mockResolvedValue({
+      path: repositoryPath,
+      cleanupPath: workspacePath,
+      branch: 'main',
+      commit: 'abc123',
+      isShallow: true,
+    });
+    vi.spyOn(GitCloneTool, 'cleanup').mockResolvedValue();
+
+    // Act
+    const results = await Promise.all([
+      ingestTool({ repository: 'owner/repository', branch: 'feature/topic' }),
+      ingestTool({ repository: 'owner/repository', tag: 'v1.0.0' }),
+      ingestTool({ repository: 'owner/repository', commit: 'abc123' }),
+      ingestTool({
+        repository: 'owner/repository',
+        sparseCheckout: true,
+        subpath: 'src',
+        includeSubmodules: true,
+      }),
+    ]);
+    const cloneOptions = clone.mock.calls.map(([options]) => options);
+
+    // Assert
+    expect(results.every((result) => result.isError === undefined)).toBe(true);
+    expect(cloneOptions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          branch: 'feature/topic',
+          commit: undefined,
+          tag: undefined,
+        }),
+        expect.objectContaining({
+          branch: undefined,
+          commit: undefined,
+          tag: 'v1.0.0',
+        }),
+        expect.objectContaining({
+          branch: undefined,
+          commit: 'abc123',
+          tag: undefined,
+        }),
+        expect.objectContaining({
+          sparse: true,
+          subpath: 'src',
+          includeSubmodules: true,
+        }),
+      ])
+    );
+  });
+
+  it('retries only transient clone failures and eventually succeeds', async () => {
+    // Arrange
+    await fs.writeFile(join(repositoryPath, 'README.md'), '# repository');
+    const clone = vi
+      .spyOn(GitCloneTool, 'clone')
+      .mockRejectedValueOnce(new Error('Connection reset by peer'))
+      .mockRejectedValueOnce(new Error('HTTP 503'))
+      .mockResolvedValue({
+        path: repositoryPath,
+        cleanupPath: workspacePath,
+        branch: 'main',
+        commit: 'abc123',
+        isShallow: true,
+      });
+    vi.spyOn(GitCloneTool, 'cleanup').mockResolvedValue();
+
+    // Act
+    const result = await ingestTool({
+      repository: 'owner/repository',
+      maxRetries: 2,
+      retryDelay: 0,
+    });
+
+    // Assert
+    expect(result.isError).toBeUndefined();
+    expect(clone).toHaveBeenCalledTimes(3);
+    expect(resultText(result)).toContain('## README.md');
+  });
+
+  it('does not retry permanent clone failures', async () => {
+    // Arrange
+    const clone = vi
+      .spyOn(GitCloneTool, 'clone')
+      .mockRejectedValue(new Error('Authentication failed'));
+
+    // Act
+    const result = await ingestTool({
+      repository: 'owner/repository',
+      maxRetries: 10,
+      retryDelay: 0,
+    });
+
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('Authentication failed');
+    expect(clone).toHaveBeenCalledOnce();
+  });
+
+  it('stops after the configured number of transient retries', async () => {
+    // Arrange
+    const clone = vi
+      .spyOn(GitCloneTool, 'clone')
+      .mockRejectedValue(new Error('Network timeout'));
+
+    // Act
+    const result = await ingestTool({
+      repository: 'owner/repository',
+      maxRetries: 2,
+      retryDelay: 0,
+    });
+
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('Network timeout');
+    expect(clone).toHaveBeenCalledTimes(3);
   });
 });
+
+function resultText(result: IngestToolResult): string {
+  const content = result.content[0];
+  if (!content || content.type !== 'text') {
+    throw new Error('Expected a text tool result');
+  }
+  return content.text;
+}

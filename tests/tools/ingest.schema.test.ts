@@ -1,90 +1,104 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it } from 'vitest';
+
+import { ingestToolDefinition } from '../../src/server/create-server.js';
 import { ingestSchema } from '../../src/tools/ingest.js';
-import { z } from 'zod';
 
-
-
-
-vi.mock('../../src/tools/git-clone.js', () => ({
-  GitCloneTool: {
-    clone: vi.fn(),
-    cleanup: vi.fn(),
-  },
-}));
-
-vi.mock('../../src/tools/local-repository.js', () => ({
-  LocalRepositoryTool: {
-    analyze: vi.fn(),
-  },
-}));
-
-vi.mock('../../src/tools/filter-engine.js', () => ({
-  FilterEngine: vi.fn().mockImplementation(() => ({
-    loadIgnorePatterns: vi.fn(),
-    shouldIncludeFile: vi.fn().mockReturnValue({ shouldInclude: true }),
-  })),
-}));
-
-vi.mock('fs/promises', () => ({
-  readFile: vi.fn().mockResolvedValue('file content'),
-}));
-
-
-
-
-describe('ingestSchema validation', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  it('should validate required repository parameter', () => {
+describe('ingest schema', () => {
+  it('applies safe defaults', () => {
     // Arrange
-    const invalidInput = {};
+    const input = { repository: 'owner/repository' };
 
     // Act
-    const act = () => ingestSchema.parse(invalidInput);
+    const value = ingestSchema.parse(input);
 
     // Assert
-    expect(act).toThrow(z.ZodError);
+    expect(value.cloneDepth).toBe(1);
+    expect(value.maxFileSize).toBe(10 * 1024 * 1024);
+    expect(value.maxFiles).toBe(1000);
+    expect(value.maxEntries).toBe(25_000);
+    expect(value.maxDepth).toBe(128);
+    expect(value.maxTotalSize).toBe(50 * 1024 * 1024);
+    expect(value.maxTokens).toBe(250_000);
+    expect(value.tokenizer).toBe('o200k_base');
+    expect(value.timeout).toBe(30_000);
   });
 
-  it('should accept valid repository parameter', () => {
+  it('rejects unsafe refs, escaping subpaths, and excessive resource limits', () => {
     // Arrange
-    const validInput = { repository: 'test-repo' };
+    const inputs = [
+      { repository: 'owner/repository', branch: '--upload-pack=payload' },
+      { repository: 'owner/repository', commit: 'main\nnext' },
+      {
+        repository: 'owner/repository',
+        sparseCheckout: true,
+        subpath: '../outside',
+      },
+      { repository: 'owner/repository', subpath: 'src' },
+      { repository: 'owner/repository', maxFileSize: 16 * 1024 * 1024 + 1 },
+      { repository: 'owner/repository', maxTotalSize: 64 * 1024 * 1024 + 1 },
+      { repository: 'owner/repository', maxFiles: 10_001 },
+      { repository: 'owner/repository', maxEntries: 100_001 },
+      { repository: 'owner/repository', maxDepth: 257 },
+      { repository: 'owner/repository', maxTokens: 1_000_001 },
+      { repository: 'owner/repository', branch: 'feature..topic' },
+      { repository: 'owner/repository', branch: 'feature/.hidden' },
+      { repository: 'owner/repository', tag: 'release.lock' },
+      { repository: 'owner/repository', commit: 'HEAD~1' },
+      { repository: 'owner/repository', token: 'secret\nnext' },
+      { repository: 'owner/repository', excludePatterns: ['!'] },
+      { repository: 'owner/repository', includePatterns: ['src\u0000file'] },
+    ];
 
     // Act
-    const result = ingestSchema.parse(validInput);
+    const actions = inputs.map((input) => () => ingestSchema.parse(input));
 
     // Assert
-    expect(result.repository).toBe('test-repo');
+    for (const action of actions) {
+      expect(action).toThrow();
+    }
   });
 
-  it('should parse timeout parameter correctly', () => {
+  it('rejects invalid limits and ambiguous refs', () => {
     // Arrange
-    const inputWithTimeout = { repository: 'test-repo', timeout: 5000 };
+    const invalidLimit = { repository: 'owner/repository', maxFiles: 0 };
+    const ambiguousRefs = {
+      repository: 'owner/repository',
+      branch: 'main',
+      tag: 'v1',
+    };
+    const sparseWithoutPath = {
+      repository: 'owner/repository',
+      sparseCheckout: true,
+    };
 
     // Act
-    const parsed = ingestSchema.parse(inputWithTimeout);
+    const parseInvalidLimit = () => ingestSchema.parse(invalidLimit);
+    const parseAmbiguousRefs = () =>
+      ingestSchema.parse({
+        ...ambiguousRefs,
+      });
+    const parseSparseWithoutPath = () => ingestSchema.parse(sparseWithoutPath);
 
     // Assert
-    expect(parsed.timeout).toBe(5000);
+    expect(parseInvalidLimit).toThrow();
+    expect(parseAmbiguousRefs).toThrow(/Only one/);
+    expect(parseSparseWithoutPath).toThrow(/subpath/);
   });
 
-  it('should use default values for optional parameters', () => {
+  it('publishes maxTokens and all other public options in MCP schema', () => {
     // Arrange
-    const minimalInput = { repository: 'test-repo' };
+    const schema = ingestToolDefinition.inputSchema;
 
     // Act
-    const parsed = ingestSchema.parse(minimalInput);
+    const properties = schema.properties;
 
     // Assert
-    expect(parsed.cloneDepth).toBe(1);
-    expect(parsed.maxFiles).toBe(1000);
-    expect(parsed.maxTotalSize).toBe(50 * 1024 * 1024);
-    expect(parsed.timeout).toBe(30000);
+    expect(properties).toHaveProperty('maxTokens');
+    expect(properties).toHaveProperty('maxTotalSize');
+    expect(properties).toHaveProperty('maxEntries');
+    expect(properties).toHaveProperty('maxDepth');
+    expect(properties).toHaveProperty('token');
+    expect(properties).toHaveProperty('tokenizer');
+    expect(properties).not.toHaveProperty('signal');
   });
 });

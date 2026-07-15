@@ -1,6 +1,21 @@
-import { promises as fs } from "fs";
-import { join, relative, resolve } from "path";
-import { GitCloneTool } from "./git-clone.js";
+import { promises as fs } from 'node:fs';
+import { homedir } from 'node:os';
+import { isAbsolute, join, resolve } from 'node:path';
+
+import type {
+  RepositoryFile,
+  RepositorySummary,
+  TreeNode,
+} from '../types/index.js';
+import {
+  buildTree,
+  countDirectories,
+  estimateTokens,
+  throwIfAborted,
+} from '../utils/index.js';
+import { FilterEngine } from './filter-engine.js';
+import { GitCloneTool } from './git-clone.js';
+import { collectRepositoryFiles } from './repository-reader.js';
 
 export interface LocalRepositoryOptions {
   path: string;
@@ -9,6 +24,10 @@ export interface LocalRepositoryOptions {
   useGitingestignore?: boolean;
   maxFileSize?: number;
   maxFiles?: number;
+  maxTotalSize?: number;
+  maxEntries?: number;
+  maxDepth?: number;
+  expectedCanonicalPath?: string;
   excludePatterns?: string[];
   includePatterns?: string[];
 }
@@ -20,88 +39,109 @@ export interface LocalRepositoryResult {
   summary: RepositorySummary;
 }
 
-export interface RepositoryFile {
-  path: string;
-  content: string;
-  size: number;
-  type: "file" | "directory" | "symlink";
-}
-
-export interface TreeNode {
-  name: string;
-  type: "file" | "directory";
-  size?: number;
-  children?: TreeNode[];
-}
-
-export interface RepositorySummary {
-  path: string;
-  branch: string;
-  commit: string;
-  fileCount: number;
-  directoryCount: number;
-  totalSize: number;
-  tokenCount: number;
-  createdAt: string;
-}
-
 export class LocalRepositoryTool {
-  private static readonly DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+  private static readonly DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024;
   private static readonly DEFAULT_MAX_FILES = 1000;
+  private static readonly DEFAULT_MAX_TOTAL_SIZE = 50 * 1024 * 1024;
+  private static readonly DEFAULT_MAX_ENTRIES = 25_000;
+  private static readonly DEFAULT_MAX_DEPTH = 128;
 
-  static async analyze(options: LocalRepositoryOptions, signal?: AbortSignal): Promise<LocalRepositoryResult> {
+  static async resolvePath(path: string): Promise<string> {
+    const expandedPath = expandHomeDirectory(path);
+    const absolutePath = isAbsolute(expandedPath)
+      ? expandedPath
+      : resolve(expandedPath);
+
+    try {
+      const stats = await fs.stat(absolutePath);
+      if (!stats.isDirectory()) {
+        throw new Error(`Local repository path is not a directory: ${path}`);
+      }
+      return await fs.realpath(absolutePath);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('not a directory')) {
+        throw error;
+      }
+      const errorCode =
+        error instanceof Error && 'code' in error
+          ? String((error as NodeJS.ErrnoException).code)
+          : undefined;
+      const message = ['ENOENT', 'ENOTDIR'].includes(errorCode ?? '')
+        ? `Local repository path does not exist: ${path}`
+        : `Unable to access local repository path: ${path}`;
+      throw new Error(message, {
+        cause: error,
+      });
+    }
+  }
+
+  static async analyze(
+    options: LocalRepositoryOptions,
+    signal?: AbortSignal
+  ): Promise<LocalRepositoryResult> {
     const {
-      path,
       includeGitignored = false,
       useGitignore = true,
       useGitingestignore = true,
       maxFileSize = this.DEFAULT_MAX_FILE_SIZE,
       maxFiles = this.DEFAULT_MAX_FILES,
+      maxTotalSize = this.DEFAULT_MAX_TOTAL_SIZE,
+      maxEntries = this.DEFAULT_MAX_ENTRIES,
+      maxDepth = this.DEFAULT_MAX_DEPTH,
       excludePatterns = [],
       includePatterns = [],
     } = options;
 
-    // Resolve absolute path
-    const absolutePath = resolve(path);
-    
-    // Check if path exists
-    try {
-      await fs.access(absolutePath);
-    } catch {
-      throw new Error(`Local repository path does not exist: ${path}`);
+    throwIfAborted(signal);
+    const absolutePath = await this.resolvePath(options.path);
+    if (
+      options.expectedCanonicalPath !== undefined &&
+      absolutePath !== options.expectedCanonicalPath
+    ) {
+      throw new Error('Repository path changed after access validation');
     }
 
-    // Get repository info
-    const repoInfo = await this.getRepositoryInfo(absolutePath);
-    
-    // Get ignore patterns
-    const ignorePatterns = await this.getIgnorePatterns(
-      absolutePath,
+    const filterEngine = new FilterEngine({
       includeGitignored,
       useGitignore,
       useGitingestignore,
-      excludePatterns
-    );
-
-    // Collect files
-    const files = await this.collectFiles(
-      absolutePath,
-      ignorePatterns,
-      includePatterns,
       maxFileSize,
       maxFiles,
+      excludePatterns,
+      includePatterns,
+    });
+    await filterEngine.loadIgnorePatterns(absolutePath, signal);
+
+    const { files } = await collectRepositoryFiles(
+      absolutePath,
+      filterEngine,
+      {
+        maxFiles,
+        maxFileSize,
+        maxTotalSize,
+        maxEntries,
+        maxDepth,
+        expectedCanonicalPath: options.expectedCanonicalPath,
+      },
       signal
     );
+    const tree = buildTree(files);
+    const repositoryInfo = await this.getRepositoryInfo(absolutePath, signal);
 
-    // Build tree structure
-    const tree = this.buildTree(files, absolutePath);
-
-    // Calculate summary
-    const summary = await this.calculateSummary(
-      absolutePath,
-      files,
-      repoInfo
-    );
+    const summary: RepositorySummary = {
+      url: absolutePath,
+      source: 'local',
+      branch: repositoryInfo.branch,
+      commit: repositoryInfo.commit,
+      fileCount: files.length,
+      directoryCount: countDirectories(tree),
+      totalSize: files.reduce((sum, file) => sum + file.size, 0),
+      tokenCount: files.reduce(
+        (sum, file) => sum + estimateTokens(file.content),
+        0
+      ),
+      createdAt: new Date().toISOString(),
+    };
 
     return {
       path: absolutePath,
@@ -111,251 +151,24 @@ export class LocalRepositoryTool {
     };
   }
 
-  private static async getRepositoryInfo(repoPath: string): Promise<{
-    branch: string;
-    commit: string;
-  }> {
-    try {
-      const branch = await GitCloneTool.getCurrentBranch(repoPath);
-      const commit = await GitCloneTool.getCurrentCommit(repoPath);
-      return { branch, commit };
-    } catch {
-      return { branch: "main", commit: "unknown" };
-    }
-  }
-
-  private static async getIgnorePatterns(
-    repoPath: string,
-    includeGitignored: boolean,
-    useGitignore: boolean,
-    useGitingestignore: boolean,
-    excludePatterns: string[]
-  ): Promise<string[]> {
-    const patterns: string[] = [];
-
-    // Add exclude patterns
-    patterns.push(...excludePatterns);
-
-    if (!includeGitignored) {
-      // Add .gitignore patterns
-      if (useGitignore) {
-        const gitignorePath = join(repoPath, ".gitignore");
-        try {
-          const gitignore = await fs.readFile(gitignorePath, "utf-8");
-          patterns.push(...this.parseIgnoreFile(gitignore));
-        } catch {
-          // .gitignore doesn't exist, ignore
-        }
-      }
-
-      // Add .gitingestignore patterns
-      if (useGitingestignore) {
-        const gitingestignorePath = join(repoPath, ".gitingestignore");
-        try {
-          const gitingestignore = await fs.readFile(gitingestignorePath, "utf-8");
-          patterns.push(...this.parseIgnoreFile(gitingestignore));
-        } catch {
-          // .gitingestignore doesn't exist, ignore
-        }
-      }
-    }
-
-    // Always ignore .git directory
-    patterns.push(".git", ".git/**");
-
-    return patterns;
-  }
-
-  private static parseIgnoreFile(content: string): string[] {
-    return content
-      .split("\n")
-      .map(line => line.trim())
-      .filter(line => line && !line.startsWith("#"))
-      .map(line => {
-        // Handle negation patterns
-        if (line.startsWith("!")) {
-          return line;
-        }
-        return line;
-      });
-  }
-
-  private static async collectFiles(
-    repoPath: string,
-    ignorePatterns: string[],
-    includePatterns: string[],
-    maxFileSize: number,
-    maxFiles: number,
+  private static async getRepositoryInfo(
+    repositoryPath: string,
     signal?: AbortSignal
-  ): Promise<RepositoryFile[]> {
-    const files: RepositoryFile[] = [];
-    
-    const walk = async (dir: string): Promise<void> => {
-      if (signal?.aborted) {
-        throw new Error('Operation aborted');
-      }
-      
-      if (files.length >= maxFiles) {
-        return;
-      }
-
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-
-      for (const entry of entries) {
-        if (files.length >= maxFiles) {
-          break;
-        }
-
-        const fullPath = join(dir, entry.name);
-        const relativePath = relative(repoPath, fullPath);
-
-        // Check ignore patterns
-        if (this.shouldIgnore(relativePath, ignorePatterns)) {
-          continue;
-        }
-
-        // Check include patterns
-        if (includePatterns.length > 0 && !this.shouldInclude(relativePath, includePatterns)) {
-          continue;
-        }
-
-        if (entry.isDirectory()) {
-          await walk(fullPath);
-        } else if (entry.isFile()) {
-          const stats = await fs.stat(fullPath);
-          
-          if (stats.size > maxFileSize) {
-            continue;
-          }
-
-          try {
-            const content = await fs.readFile(fullPath, "utf-8");
-            files.push({
-              path: relativePath,
-              content,
-              size: stats.size,
-              type: "file",
-            });
-          } catch {
-            // Skip binary files or files that can't be read as text
-          }
-        }
-      }
-    };
-
-    await walk(repoPath);
-    return files;
+  ): Promise<{ branch: string; commit: string }> {
+    const [branch, commit] = await Promise.all([
+      GitCloneTool.getCurrentBranch(repositoryPath, signal),
+      GitCloneTool.getCurrentCommit(repositoryPath, signal),
+    ]);
+    return { branch, commit };
   }
+}
 
-  private static shouldIgnore(path: string, patterns: string[]): boolean {
-    for (const pattern of patterns) {
-      if (pattern.startsWith("!")) {
-        // Negation pattern
-        const negatedPattern = pattern.slice(1);
-        if (this.matchesPattern(path, negatedPattern)) {
-          return false;
-        }
-      } else if (this.matchesPattern(path, pattern)) {
-        return true;
-      }
-    }
-    return false;
+function expandHomeDirectory(path: string): string {
+  if (path === '~') {
+    return homedir();
   }
-
-  private static shouldInclude(path: string, patterns: string[]): boolean {
-    for (const pattern of patterns) {
-      if (this.matchesPattern(path, pattern)) {
-        return true;
-      }
-    }
-    return patterns.length === 0;
+  if (path.startsWith('~/') || path.startsWith('~\\')) {
+    return join(homedir(), path.slice(2));
   }
-
-  private static matchesPattern(path: string, pattern: string): boolean {
-    // Simple glob matching
-    const regex = pattern
-      .replace(/\*\*/g, ".*")
-      .replace(/\*/g, "[^/]*")
-      .replace(/\?/g, "[^/]");
-    
-    return new RegExp(`^${regex}$`).test(path);
-  }
-
-  private static buildTree(files: RepositoryFile[], repoPath: string): TreeNode {
-    const root: TreeNode = {
-      name: "",
-      type: "directory",
-      children: [],
-    };
-
-    for (const file of files) {
-      const parts = file.path.split("/");
-      let current = root;
-
-      for (let i = 0; i < parts.length; i++) {
-        const part = parts[i];
-        const isFile = i === parts.length - 1;
-
-        if (isFile) {
-          current.children = current.children || [];
-          current.children.push({
-            name: part,
-            type: "file",
-            size: file.size,
-          });
-        } else {
-          let dir = current.children?.find(
-            child => child.name === part && child.type === "directory"
-          );
-
-          if (!dir) {
-            dir = {
-              name: part,
-              type: "directory",
-              children: [],
-            };
-            current.children = current.children || [];
-            current.children.push(dir);
-          }
-
-          current = dir;
-        }
-      }
-    }
-
-    return root;
-  }
-
-  private static async calculateSummary(
-    repoPath: string,
-    files: RepositoryFile[],
-    repoInfo: { branch: string; commit: string }
-  ): Promise<RepositorySummary> {
-    const totalSize = files.reduce((sum, file) => sum + file.size, 0);
-    const tokenCount = files.reduce((sum, file) => sum + this.estimateTokens(file.content), 0);
-    
-    const directories = new Set<string>();
-    for (const file of files) {
-      const parts = file.path.split("/");
-      for (let i = 0; i < parts.length - 1; i++) {
-        directories.add(parts.slice(0, i + 1).join("/"));
-      }
-    }
-
-    return {
-      path: repoPath,
-      branch: repoInfo.branch,
-      commit: repoInfo.commit,
-      fileCount: files.length,
-      directoryCount: directories.size,
-      totalSize,
-      tokenCount,
-      createdAt: new Date().toISOString(),
-    };
-  }
-
-  private static estimateTokens(content: string): number {
-    // Rough estimation: 1 token ≈ 4 characters
-    return Math.ceil(content.length / 4);
-  }
+  return path;
 }

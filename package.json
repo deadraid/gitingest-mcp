@@ -2,17 +2,38 @@
   "name": "gitingest-mcp",
   "version": "1.0.1",
   "description": "MCP server for transforming Git repositories into LLM-friendly text digests",
+  "author": "RaidHon",
   "type": "module",
+  "sideEffects": false,
   "main": "dist/server/index.js",
   "types": "dist/server/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
     "start": "node dist/server/index.js",
-    "dev": "ts-node src/server/index.ts",
-    "lint": "eslint . --ext .ts",
-    "lint:fix": "eslint . --ext .ts --fix",
-    "test": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "start:http": "node dist/server/http-server.js",
+    "dev": "tsx src/server/index.ts",
+    "dev:http": "tsx src/server/http-server.ts",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "prepack": "npm run clean && npm run build",
+    "prepublishOnly": "npm test && npm run lint"
   },
   "keywords": [
     "mcp",
@@ -24,31 +45,43 @@
     "ai-tools",
     "code-analysis"
   ],
-  "author": "",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deadraid/gitingest-mcp.git"
+  },
+  "homepage": "https://github.com/deadraid/gitingest-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/deadraid/gitingest-mcp/issues"
+  },
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "~1.17.0",
-    "js-yaml": "~4.1.0",
-    "minimatch": "~10.0.1",
-    "node-fetch": "~3.3.2",
-    "zod": "~4.0.9"
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "fastify": "5.10.0",
+    "ignore": "7.0.6",
+    "js-tiktoken": "1.0.21",
+    "minimatch": "10.2.5",
+    "zod": "4.4.3"
   },
   "devDependencies": {
-    "@types/node": "24.1.0",
-    "@typescript-eslint/eslint-plugin": "8.38.0",
-    "@typescript-eslint/parser": "8.38.0",
-    "@vitest/coverage-v8": "3.2.4",
-    "eslint": "9.31.0",
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.1.1",
+    "@vitest/coverage-v8": "4.1.10",
+    "eslint": "10.7.0",
     "eslint-config-prettier": "10.1.8",
-    "eslint-plugin-prettier": "5.5.3",
-    "ts-node": "10.9.2",
-    "typescript": "5.8.3",
-    "vitest": "3.2.4"
+    "eslint-plugin-prettier": "5.5.6",
+    "globals": "17.7.0",
+    "prettier": "3.9.5",
+    "tsx": "4.23.1",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.64.0",
+    "vitest": "4.1.10"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.19.0"
   },
   "bin": {
-    "gitingest-mcp-server": "dist/server/index.js"
+    "gitingest-mcp": "dist/server/index.js",
+    "gitingest-mcp-server": "dist/server/index.js",
+    "gitingest-mcp-http": "dist/server/http-server.js"
   }
 }

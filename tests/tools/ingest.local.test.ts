@@ -1,272 +1,457 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { ingestTool } from '../../src/tools/ingest.js';
-import { FilterEngine } from '../../src/tools/filter-engine.js';
-import { LocalRepositoryTool } from '../../src/tools/local-repository.js';
-import type { IngestInput } from '../../src/tools/ingest.js';
+import { promises as fs } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { ingestTool, type IngestToolResult } from '../../src/tools/ingest.js';
+import { countTextTokens, getTokenizer } from '../../src/utils/tokenizer.js';
 
+describe('local repository ingestion', () => {
+  let repositoryPath: string;
+  const cleanupPaths: string[] = [];
 
-vi.mock('../../src/tools/git-clone.js', () => ({
-  GitCloneTool: {
-    clone: vi.fn(),
-    cleanup: vi.fn(),
-  },
-}));
-
-vi.mock('../../src/tools/local-repository.js', () => ({
-  LocalRepositoryTool: {
-    analyze: vi.fn(),
-  },
-}));
-
-vi.mock('../../src/tools/filter-engine.js', () => {
-
-  const mockFilterEngine = {
-    loadIgnorePatterns: vi.fn().mockResolvedValue(undefined),
-    shouldIncludeFile: vi.fn().mockReturnValue({ shouldInclude: true }),
-  };
-
-
-  const FilterEngine = vi.fn().mockImplementation((options) => {
-    return mockFilterEngine;
+  beforeEach(async () => {
+    repositoryPath = await fs.mkdtemp(join(tmpdir(), 'gitingest-test-'));
+    cleanupPaths.push(repositoryPath);
   });
 
-  return { FilterEngine };
-});
-
-vi.mock('fs/promises', () => ({
-  readFile: vi.fn().mockResolvedValue('file content'),
-}));
-
-
-
-
-const baseInput: IngestInput = {
-  repository: '/path/to/local/repo',
-  cloneDepth: 1,
-  sparseCheckout: false,
-  includeSubmodules: false,
-  includeGitignored: false,
-  useGitignore: true,
-  useGitingestignore: true,
-  maxFiles: 1000,
-  maxFileSize: undefined as number | undefined,
-  excludePatterns: [] as string[],
-  includePatterns: [] as string[],
-  maxTotalSize: 50 * 1024 * 1024,
-  token: undefined as string | undefined,
-  maxRetries: 3,
-  retryDelay: 1000,
-  maxTokens: undefined as number | undefined,
-  timeout: 30000,
-};
-
-function input(overrides: Partial<IngestInput> = {}): IngestInput {
-  return { ...baseInput, ...overrides };
-}
-
-
-
-
-function buildMockLocalRepo(
-  files: Array<{ path: string; content: string; size: number }>
-) {
-  return {
-    path: '/tmp/repo',
-    summary: {
-      path: '/tmp/repo',
-      branch: 'main',
-      commit: 'abc123',
-      fileCount: files.length,
-      directoryCount: 1,
-      totalSize: files.reduce((s, f) => s + f.size, 0),
-      tokenCount: files.reduce(
-        (s, f) => s + Math.ceil(f.content.length / 4),
-        0
-      ),
-      createdAt: new Date().toISOString(),
-    },
-    files: files.map((f) => ({ ...f, type: 'file' as const })),
-    tree: {
-      name: '',
-      type: 'directory' as const,
-      children: [
-        {
-          name: 'src',
-          type: 'directory' as const,
-          children: files.map((f) => ({
-            name: f.path.split('/').pop()!,
-            type: 'file' as const,
-            size: f.size,
-          })),
-        },
-      ],
-    },
-  };
-}
-
-
-
-
-describe('ingestTool – Local Repository & Filters', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
+  afterEach(async () => {
+    await Promise.all(
+      cleanupPaths
+        .splice(0)
+        .map((path) => fs.rm(path, { recursive: true, force: true }))
+    );
   });
 
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  it('processes local repository successfully', async () => {
+  it('applies nested ignore files with full gitignore escaping semantics', async () => {
     // Arrange
-    const mockRepo = buildMockLocalRepo([
-      {
-        path: 'src/index.ts',
-        content: 'console.log("Hello World");',
-        size: 25,
-      },
-    ]);
-    vi.mocked(LocalRepositoryTool.analyze).mockResolvedValue(mockRepo);
+    await writeFile(
+      'src/.gitignore',
+      ['*.generated', '!important.generated', '\\#literal.txt'].join('\n')
+    );
+    await writeFile('src/.gitingestignore', 'private.txt\n');
+    await writeFile('src/drop.generated', 'drop');
+    await writeFile('src/important.generated', 'keep');
+    await writeFile('src/#literal.txt', 'escaped pattern');
+    await writeFile('src/private.txt', 'private');
 
     // Act
-    const result = await ingestTool(input());
+    const result = await ingestTool({ repository: repositoryPath });
+    const output = resultText(result);
+
+    // Assert
+    expect(output).toContain('## src/important.generated');
+    expect(output).not.toContain('## src/drop.generated');
+    expect(output).not.toContain('## src/#literal.txt');
+    expect(output).not.toContain('## src/private.txt');
+  });
+
+  it('finds nested files selected by includePatterns', async () => {
+    // Arrange
+    await writeFile('src/index.ts', 'export const value = 42;');
+    await writeFile('src/index.js', 'export const ignored = true;');
+
+    // Act
+    const result = await ingestTool({
+      repository: repositoryPath,
+      includePatterns: ['**/*.ts'],
+    });
+    const output = resultText(result);
 
     // Assert
     expect(result.isError).toBeUndefined();
-    expect(result.content[0].text).toContain('Repository Summary');
-    expect(result.content[0].text).toContain('src/index.ts');
+    expect(output).toContain('## src/index.ts');
+    expect(output).not.toContain('## src/index.js');
   });
 
-  it('applies exclude patterns correctly', async () => {
+  it('applies gitignore, gitingestignore, and explicit exclusions', async () => {
     // Arrange
-    const mockRepo = buildMockLocalRepo([
-      {
-        path: 'src/index.ts',
-        content: 'console.log("Hello World");',
-        size: 25,
-      },
-      { path: 'logs/app.log', content: 'error', size: 10 },
-    ]);
-    vi.mocked(LocalRepositoryTool.analyze).mockResolvedValue(mockRepo);
-
-
-    vi.mocked(FilterEngine).mockImplementation(
-      () =>
-        ({
-          loadIgnorePatterns: vi.fn(),
-          shouldIncludeFile: vi.fn((p: string) => ({
-            shouldInclude: !p.endsWith('.log'),
-          })),
-          options: {},
-        }) as unknown as InstanceType<typeof FilterEngine>
+    await writeFile(
+      '.gitignore',
+      ['ignored.txt', 'generated/**', '!generated/keep.txt'].join('\n')
     );
+    await writeFile('.gitingestignore', 'private/**\n');
+    await writeFile('ignored.txt', 'ignored');
+    await writeFile('generated/drop.txt', 'generated and ignored');
+    await writeFile('generated/keep.txt', 'generated but included');
+    await writeFile('private/secret.txt', 'secret');
+    await writeFile('logs/app.log', 'log');
+    await writeFile('src/index.ts', 'included');
 
     // Act
-    const result = await ingestTool(input({ excludePatterns: ['*.log'] }));
+    const result = await ingestTool({
+      repository: repositoryPath,
+      excludePatterns: ['**/*.log'],
+    });
+    const output = resultText(result);
 
     // Assert
-    expect(result.content[0].text).toContain('src/index.ts');
-    expect(result.content[0].text).not.toContain('logs/app.log');
+    expect(output).toContain('## src/index.ts');
+    expect(output).toContain('## generated/keep.txt');
+    expect(output).not.toContain('## ignored.txt');
+    expect(output).not.toContain('## generated/drop.txt');
+    expect(output).not.toContain('secret');
+    expect(output).not.toContain('## logs/app.log');
   });
 
-  it('respects maxFileSize limit', async () => {
+  it('applies ordered explicit negations and literal leading bangs', async () => {
     // Arrange
-    const mockRepo = buildMockLocalRepo([
-      { path: 'src/small.ts', content: 'small', size: 20 },
-      { path: 'dist/large.js', content: 'big'.repeat(50000), size: 200000 },
-    ]);
-    vi.mocked(LocalRepositoryTool.analyze).mockResolvedValue(mockRepo);
-
-    vi.mocked(FilterEngine).mockImplementation(
-      () =>
-        ({
-          loadIgnorePatterns: vi.fn(),
-          shouldIncludeFile: vi.fn((_: string, size: number) => ({
-            shouldInclude: size < 100000,
-          })),
-          options: {},
-        }) as unknown as InstanceType<typeof FilterEngine>
-    );
+    await writeFile('drop.txt', 'drop');
+    await writeFile('keep.txt', 'keep');
+    await writeFile('!important.txt', 'important');
 
     // Act
-    const result = await ingestTool(input({ maxFileSize: 100000 }));
+    const result = await ingestTool({
+      repository: repositoryPath,
+      excludePatterns: ['**/*.txt', '!keep.txt', '!\\!important.txt'],
+    });
+    const output = resultText(result);
 
     // Assert
-    expect(result.content[0].text).toContain('src/small.ts');
-    expect(result.content[0].text).not.toContain('dist/large.js');
+    expect(output).not.toContain('## drop.txt');
+    expect(output).toContain('## keep.txt');
+    expect(output).toContain('## !important.txt');
   });
 
-  it('respects maxFiles limit', async () => {
+  it('enforces maxFileSize', async () => {
     // Arrange
-    const manyFiles = Array(30)
-      .fill(null)
-      .map((_, i) => ({
-        path: `src/file${i}.ts`,
-        content: 'x',
-        size: 4,
-      }));
-    const mockRepo = buildMockLocalRepo(manyFiles);
-    vi.mocked(LocalRepositoryTool.analyze).mockResolvedValue(mockRepo);
-
-
-    let count = 0;
-    vi.mocked(FilterEngine).mockImplementation(
-      () =>
-        ({
-          loadIgnorePatterns: vi.fn(),
-          shouldIncludeFile: vi.fn(() => {
-            count += 1;
-            return { shouldInclude: count <= 20 };
-          }),
-          options: { maxFiles: 20 },
-        }) as unknown as InstanceType<typeof FilterEngine>
-    );
+    await writeFile('small.txt', 'included');
+    await writeFile('large.txt', 'x'.repeat(100));
 
     // Act
-    const result = await ingestTool(input({ maxFiles: 20 }));
+    const result = await ingestTool({
+      repository: repositoryPath,
+      maxFileSize: 50,
+    });
+    const output = resultText(result);
 
     // Assert
-    expect(result.content[0].text).toContain('- **Files**: 20');
+    expect(output).toContain('**Files**: 1');
+    expect(output).toContain('## small.txt');
+    expect(output).not.toContain('## large.txt');
   });
 
-  it('respects maxTokens limit', async () => {
+  it('enforces maxFiles in deterministic path order', async () => {
     // Arrange
-    const mockRepoTokens = buildMockLocalRepo([
-      { path: 'src/small.ts', content: 'console.log("hello");', size: 22 },
-      { path: 'src/tiny.ts', content: 'export default {}', size: 17 },
-    ]);
-    vi.mocked(LocalRepositoryTool.analyze).mockResolvedValue(mockRepoTokens);
-
-
-    vi.mocked(FilterEngine).mockImplementation(
-      () =>
-        ({
-          loadIgnorePatterns: vi.fn(),
-          shouldIncludeFile: vi.fn().mockReturnValue({ shouldInclude: true }),
-          options: {},
-        }) as unknown as InstanceType<typeof FilterEngine>
-    );
+    await writeFile('c.txt', 'third');
+    await writeFile('a.txt', 'first');
+    await writeFile('b.txt', 'second');
 
     // Act
-    const result = await ingestTool(input({ maxTokens: 50 }));
+    const result = await ingestTool({
+      repository: repositoryPath,
+      maxFiles: 2,
+    });
+    const output = resultText(result);
+
+    // Assert
+    expect(output).toContain('**Files**: 2');
+    expect(output).toContain('## a.txt');
+    expect(output).toContain('## b.txt');
+    expect(output).not.toContain('## c.txt');
+  });
+
+  it('enforces maxTotalSize across included files', async () => {
+    // Arrange
+    await writeFile('a.txt', '12345678');
+    await writeFile('b.txt', 'abcdefgh');
+
+    // Act
+    const result = await ingestTool({
+      repository: repositoryPath,
+      maxTotalSize: 10,
+    });
+    const output = resultText(result);
+
+    // Assert
+    expect(output).toContain('**Files**: 1');
+    expect(output).toContain('**Size**: 8 B');
+    expect(output).toContain('## a.txt');
+    expect(output).not.toContain('## b.txt');
+  });
+
+  it('keeps the complete digest within the maxTokens budget', async () => {
+    // Arrange
+    await writeFile('source.ts', 'const value = 1;\n'.repeat(200));
+    const maxTokens = 400;
+    const tokenizer = await getTokenizer('o200k_base');
+
+    // Act
+    const result = await ingestTool({
+      repository: repositoryPath,
+      maxTokens,
+    });
+    const output = resultText(result);
+
+    // Assert
+    expect(countTextTokens(tokenizer, output)).toBeLessThanOrEqual(maxTokens);
+    expect(output).toContain('## source.ts');
+    expect(output).toContain('[truncated by maxTokens]');
+  });
+
+  it('treats tokenizer special strings and Unicode as ordinary content', async () => {
+    // Arrange
+    await writeFile('tokens.txt', '<|endoftext|> 😀 Привет мир\n'.repeat(200));
+    const maxTokens = 400;
+    const tokenizer = await getTokenizer('cl100k_base');
+
+    // Act
+    const result = await ingestTool({
+      repository: repositoryPath,
+      maxTokens,
+      tokenizer: 'cl100k_base',
+    });
+    const output = resultText(result);
 
     // Assert
     expect(result.isError).toBeUndefined();
-    expect(result.content[0].text).toContain('Repository Summary');
+    expect(countTextTokens(tokenizer, output)).toBeLessThanOrEqual(maxTokens);
+    expect(output).toContain('<|endoftext|>');
+    expect(Buffer.from(output, 'utf8').toString('utf8')).toBe(output);
+    expect(output).not.toContain('\uFFFD');
   });
 
-  it('handles invalid repository path error', async () => {
+  it('skips binary files and symlinks', async () => {
     // Arrange
-    vi.mocked(LocalRepositoryTool.analyze).mockRejectedValue(
-      new Error('Repository not found')
+    const outsidePath = await fs.mkdtemp(join(tmpdir(), 'gitingest-outside-'));
+    cleanupPaths.push(outsidePath);
+    await fs.writeFile(join(outsidePath, 'outside-secret.txt'), 'outside');
+    await writeFile('text.txt', 'plain text');
+    await writeFile('.git/config', 'git metadata');
+    await fs.writeFile(
+      join(repositoryPath, 'binary.bin'),
+      Buffer.from([0, 1, 2, 3])
     );
+    await fs.symlink(
+      join(repositoryPath, 'text.txt'),
+      join(repositoryPath, 'link.txt')
+    );
+    await fs.symlink(outsidePath, join(repositoryPath, 'linked-directory'));
 
     // Act
-    const result = await ingestTool(input({ repository: '/invalid/path' }));
+    const result = await ingestTool({ repository: repositoryPath });
+    const output = resultText(result);
+
+    // Assert
+    expect(output).toContain('## text.txt');
+    expect(output).not.toContain('binary.bin');
+    expect(output).not.toContain('link.txt');
+    expect(output).not.toContain('outside-secret.txt');
+    expect(output).not.toContain('git metadata');
+  });
+
+  it('fails closed when an ignore file exceeds its resource limit', async () => {
+    // Arrange
+    await writeFile('.gitingestignore', 'x'.repeat(1024 * 1024 + 1));
+    await writeFile('secret.txt', 'must not be ingested');
+
+    // Act
+    const result = await ingestTool({ repository: repositoryPath });
 
     // Assert
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('Repository not found');
+    expect(resultText(result)).toContain('Ignore file exceeds');
+    expect(resultText(result)).not.toContain('must not be ingested');
   });
+
+  it('enforces the repository entry scan budget', async () => {
+    // Arrange
+    await writeFile('a.txt', 'a');
+    await writeFile('b.txt', 'b');
+    await writeFile('c.txt', 'c');
+
+    // Act
+    const result = await ingestTool({
+      repository: repositoryPath,
+      maxEntries: 2,
+    });
+
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('maximum of 2 entries');
+  });
+
+  it('enforces the repository traversal depth budget', async () => {
+    // Arrange
+    await writeFile('one/two/file.txt', 'content');
+
+    // Act
+    const result = await ingestTool({
+      repository: repositoryPath,
+      maxDepth: 1,
+    });
+
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('maximum depth of 1');
+  });
+
+  it('always excludes a .git file as well as a .git directory', async () => {
+    // Arrange
+    await writeFile('.git', 'gitdir: outside');
+    await writeFile('.GIT-case-test', 'ordinary file');
+    await writeFile('source.txt', 'included');
+
+    // Act
+    const result = await ingestTool({ repository: repositoryPath });
+    const output = resultText(result);
+
+    // Assert
+    expect(result.isError).toBeUndefined();
+    expect(output).toContain('## source.txt');
+    expect(output).toContain('## .GIT-case-test');
+    expect(output).not.toContain('gitdir: outside');
+  });
+
+  it('excludes case variants of Git metadata directories', async () => {
+    // Arrange
+    await writeFile('.GIT/config', 'case-insensitive git metadata');
+    await writeFile('source.txt', 'included');
+
+    // Act
+    const result = await ingestTool({ repository: repositoryPath });
+    const output = resultText(result);
+
+    // Assert
+    expect(output).toContain('## source.txt');
+    expect(output).not.toContain('case-insensitive git metadata');
+  });
+
+  it('limits the total number of rules loaded from ignore files', async () => {
+    // Arrange
+    await writeFile('.gitingestignore', 'ignored\n'.repeat(50_000));
+    await writeFile('secret.txt', 'must not be ingested');
+
+    // Act
+    const result = await ingestTool({ repository: repositoryPath });
+
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('50000 rules');
+    expect(resultText(result)).not.toContain('must not be ingested');
+  });
+
+  it('limits the total bytes loaded from nested ignore files', async () => {
+    // Arrange
+    const ignoreContent = `#${'x'.repeat(900 * 1024 - 1)}`;
+    for (let index = 0; index < 5; index += 1) {
+      await writeFile(`directory-${index}/.gitingestignore`, ignoreContent);
+    }
+
+    // Act
+    const result = await ingestTool({
+      repository: repositoryPath,
+      maxFiles: 10_000,
+    });
+
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('4194304 bytes in total');
+  });
+
+  it('limits the number of nested ignore files', async () => {
+    // Arrange
+    for (let index = 0; index < 513; index += 1) {
+      await writeFile(`directory-${index}/.gitignore`, '');
+      await writeFile(`directory-${index}/.gitingestignore`, '');
+    }
+
+    // Act
+    const result = await ingestTool({
+      repository: repositoryPath,
+      maxFiles: 2000,
+      maxEntries: 3000,
+    });
+
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('maximum of 1024 ignore files');
+  });
+
+  it('rejects glob patterns with excessive brace expansion', async () => {
+    // Arrange
+    await writeFile('source.txt', 'content');
+
+    // Act
+    const result = await ingestTool({
+      repository: repositoryPath,
+      excludePatterns: ['file-{1..100}.txt'],
+    });
+
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('32 brace expansions');
+  });
+
+  it('enforces the local-path allowlist used by HTTP transport', async () => {
+    // Arrange
+    await writeFile('source.ts', 'content');
+
+    // Act
+    const result = await ingestTool(
+      { repository: repositoryPath },
+      {
+        allowUnrestrictedLocalRepositories: false,
+        allowedLocalRoots: [],
+      }
+    );
+
+    // Assert
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('Local repository access is disabled');
+  });
+
+  it('rejects remote-only options for a local repository', async () => {
+    // Arrange
+    await writeFile('source.ts', 'content');
+    const inputs = [
+      { repository: repositoryPath, branch: 'main' },
+      { repository: repositoryPath, token: 'secret' },
+      { repository: repositoryPath, includeSubmodules: true },
+      { repository: repositoryPath, cloneDepth: 2 },
+      { repository: repositoryPath, maxRetries: 2 },
+      { repository: repositoryPath, retryDelay: 2 },
+    ];
+
+    // Act
+    const results = await Promise.all(inputs.map((input) => ingestTool(input)));
+
+    // Assert
+    for (const result of results) {
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toContain('only for remote repositories');
+    }
+  });
+
+  it('distinguishes a file path from a missing local repository', async () => {
+    // Arrange
+    const filePath = join(repositoryPath, 'not-a-directory.txt');
+    const missingPath = join(repositoryPath, 'missing');
+    await fs.writeFile(filePath, 'content');
+
+    // Act
+    const fileResult = await ingestTool({ repository: filePath });
+    const missingResult = await ingestTool({ repository: missingPath });
+
+    // Assert
+    expect(fileResult.isError).toBe(true);
+    expect(resultText(fileResult)).toContain('is not a directory');
+    expect(missingResult.isError).toBe(true);
+    expect(resultText(missingResult)).toContain('does not exist');
+  });
+
+  async function writeFile(path: string, content: string): Promise<void> {
+    const fullPath = join(repositoryPath, path);
+    await fs.mkdir(join(fullPath, '..'), { recursive: true });
+    await fs.writeFile(fullPath, content);
+  }
 });
+
+function resultText(result: IngestToolResult): string {
+  const content = result.content[0];
+  if (!content || content.type !== 'text') {
+    throw new Error('Expected a text tool result');
+  }
+  return content.text;
+}
